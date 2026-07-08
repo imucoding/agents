@@ -54,3 +54,50 @@ system_template_part_1 = PromptTemplate.from_template("a : {a}")
 system_template_part_2 = PromptTemplate.from_template("b : {b}")
 system_template_merged = system_template_part_1 + " " + system_template_part_2
 print(system_template_merged.invoke({"a":"a", "b":"b"}).text)
+
+# CoT 프롬프트
+from langsmith import Client
+from langchain_core.output_parsers import StrOutputParser
+
+client = Client()
+math_cot_prompt = client.pull_prompt("arietem/math_cot", dangerously_pull_public_prompt=True,)
+cot_chain = math_cot_prompt | llm | StrOutputParser()
+
+# print(math_cot_prompt)
+# print(cot_chain.invoke({"question" : "Solve equation 2*x+5=15"}))
+
+
+# CoT를 통해 긴 사고 과정으로 답을 만들게 하고 그 이후 단계의 프롬프팅을 통해 답만 추출
+from operator import itemgetter
+
+parse_prompt = (
+    "Given the initial question and a full answer,"
+    "extract the concise answer. Do not assume anything end "
+    "only use a provided full answer. \n\n Question : \n {question}\n"
+    "FULL ANSWER : \n{full_answer}\n\n CONCISE ANSWER:\n"
+)
+
+parse_prompt_template = PromptTemplate.from_template(parse_prompt)
+
+final_chain = (
+    {"full_answer" : itemgetter("question") | cot_chain,
+     "question" : itemgetter("question")}
+    | parse_prompt_template
+    | llm
+    | StrOutputParser()
+)
+
+# print(final_chain.invoke(({"question" : "Solve equation 2*x+5=15"})))
+
+
+# 자기 일관성
+'''
+온도를 높여서 더 다양한 출력이 나오게하고 여러번 수행하여 그중 가장 빈번한것을 선택
+'''
+generations = []
+for _ in range(20):
+    generations.append(final_chain.invoke({"question" : "Solve equation 2*x+5=15"}, temperature=2.0).strip())
+
+from collections import Counter
+print(Counter(generations).most_common(1)[0][0])
+
