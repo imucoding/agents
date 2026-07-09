@@ -14,7 +14,7 @@ from langchain_core.output_parsers import StrOutputParser
 #
 # chain = prompt | local_llm | StrOutputParser()
 #
-# result = chain.invoke({"concept":"quantum computing"})
+# result = chain.invoke({"concept":"quantum `computing"})
 # print(result)
 
 from langchain_core.messages import SystemMessage, HumanMessage
