@@ -2,6 +2,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph
 
 llm = ChatOllama(
     model="gemma4:e4b",
@@ -101,3 +102,107 @@ for _ in range(20):
 from collections import Counter
 print(Counter(generations).most_common(1)[0][0])
 
+# 맵-리듀스
+from langgraph.constants import Send
+import operator
+from typing_extensions import TypedDict, Annotated
+
+from langgraph.graph import StateGraph, START, END
+
+reduce_prompt = ChatPromptTemplate.from_template("""
+다음은 영상을 일정 시간 단위로 요약한 내용입니다.
+
+{summaries}
+
+이 내용을 하나의 자연스러운 전체 영상 요약으로 만들어주세요.
+""")
+
+
+def _merge_summaries( summaries: list[str], interval_secs: int,):
+    merged = []
+
+    for index, summary in enumerate(summaries):
+        start = index * interval_secs
+        end = (index + 1) * interval_secs
+
+        merged.append(
+            f"""
+            [{start}초 ~ {end}초]
+            
+            {summary}
+            """
+        )
+
+    return "\n".join(merged)
+
+class AgentState(TypedDict):
+    video_url: str
+    chunks: int
+    interval_secs: int
+    summaries: Annotated[list, operator.add] # 타입은 list이고 다른 값이 들어오면 덮어쓰지않고 add함
+    final_summary: str
+
+class _ChunkState(TypedDict):
+    video_url: str
+    start_offset: int
+    interval_secs: int
+
+human_part = {"type" : "text", "text" : "Provide a summary of the video."}
+
+async def _summarize_video_chunk(state: _ChunkState):
+    start_offset = state["start_offset"]
+    interval_secs = state["interval_secs"]
+    video_part = {
+        "type" : "media", "file_uri" : state["video_url"], "mime_type" : "video/mp4",
+        "video_metadata" : {
+            "start_offset" : start_offset * interval_secs,
+            "end_offset" : (start_offset+1) * interval_secs,
+        }
+    }
+    response = await llm.ainvoke(
+        [HumanMessage(content=[human_part, video_part])]
+    )
+    return {"summaries" : [response.content]}
+
+async def _generate_final_summary(state: AgentState):
+    summary = _merge_summaries(
+        summaries=state["summaries"],
+        interval_secs=state["interval_secs"]
+    )
+    final_summary = await (reduce_prompt | llm | StrOutputParser()).ainvoke({"summaries" : summary})
+    return {"final_summary" : final_summary}
+
+def _map_summaries(state: AgentState):
+    chunks = state["chunks"]
+    payloads = [{
+        "video_url" : state["video_url"],
+        "interval_secs": state["interval_secs"],
+        "start_offset" : i
+    } for i in range(state["chunks"])]
+    return [Send("summarize_video_chunk", payload) for payload in payloads]
+# Send는 노드를 호출하는 langgraph API이고 langgraph에서는 직접 노드를 호출해서는 안됨
+# State 관리, 체크포인트 등을 모두 langgraph가 관리하기 때문에 Send를 통해서 해야함
+
+graph = StateGraph(AgentState)
+graph.add_node("summarize_video_chunk", _summarize_video_chunk)
+graph.add_node("generate_final_summary", _generate_final_summary)
+
+graph.add_conditional_edges(START, _map_summaries, ["summarize_video_chunk"])
+'''
+add_conditional_edges(start, condition, [path_map]) 형태
+_map_summaries는 Send를 생성하는 노드이고 video_chunk를 알기 전까지 몇개를 만들 지(몇개의 노드 연결이 생길지) 정해지지 않음
+일반 add_edge는 정적으로 고정해버리는 것이므로 사용할 수 없음
+만약 _map_summaries에서 Send하는 대상이 _generate_final_summary도 있었다면 path_map에 같이 추가되어야함
+'''
+graph.add_edge("summarize_video_chunk", "generate_final_summary") # _generate_final_summary는 한번만 실행
+graph.add_edge("generate_final_summary", END)
+app = graph.compile()
+
+result = await app.ainvoke(
+    {
+        "video_uri" : video_url,
+        "chunks" : 5,
+        "interval_secs" : 600
+    },
+    {"max_concurrency": 3}
+)["final_summary"]
